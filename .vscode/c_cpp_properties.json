@@ -1,0 +1,21 @@
+{
+  "configurations": [
+    {
+      "name": "Mac Catalyst ARM64",
+      "compilerPath": "/Library/Developer/CommandLineTools/usr/bin/clang",
+      "compilerArgs": [
+        "-target",
+        "arm64-apple-ios14.0-macabi",
+        "-isysroot",
+        "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+        "-fblocks"
+      ],
+      "includePath": [
+        "${workspaceFolder}"
+      ],
+      "cStandard": "c11",
+      "intelliSenseMode": "macos-clang-arm64"
+    }
+  ],
+  "version": 4
+}

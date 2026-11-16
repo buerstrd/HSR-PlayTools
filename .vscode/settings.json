@@ -1,0 +1,8 @@
+{
+  "files.associations": {
+    "*.luau": "lua"
+  },
+  "files.exclude": {
+    "**/__pycache__": true
+  }
+}
