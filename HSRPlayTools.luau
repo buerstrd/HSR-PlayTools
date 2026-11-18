@@ -153,6 +153,7 @@ end
 -- One owner and one cleanup path for the menu entry and independent overlay.
 local function disposeSettings()
     if state.settingsLeave then pcall(state.settingsLeave) end
+    if __HSRMouseCapture then __HSRMouseCapture(-15) end
     state.uiTransitions=nil
     state.consoleRefresh=nil
     state.altModeTap=nil
@@ -364,6 +365,8 @@ local function updateSettings()
         local console = rect("UnityConsole", created.transform, 0, 0, 1500, 850)
         console:AddComponent(typeof(UE.UI.Image)).color = UE.Color(0.9, 0.9, 0.9, 1)
         panelShadow(console)
+        local consoleTitle=label(rect("Title",console.transform,-490,380,420,44),"Unity控制台")
+        consoleTitle.alignment=UE.TextAnchor.MiddleLeft
         local outputArea = rect("Output", console.transform, 0, 10, 1400, 640)
         outputArea:AddComponent(typeof(UE.UI.Image)).color = UE.Color(0.98, 0.98, 0.98, 1)
         outputArea:AddComponent(typeof(UE.UI.RectMask2D))
@@ -519,10 +522,11 @@ local function updateSettings()
         local function leave()
             transition(panel,false)
             transition(console,false)
-            transition(blocker,false)
+            transition(blocker,false,function() __HSRMouseCapture(-15) end)
             state.playtoolsPageOpen = false
         end
         local function openPlayTools()
+            __HSRMouseCapture(-14)
             refresh()
             transition(blocker,true)
             transition(panel,true)
@@ -690,6 +694,9 @@ if type(rawget(_G,"__HSRNativeInputFrame"))~="function" then
                 return
             end
             if __HSRMouseDimensions then __HSRMouseDimensions(UE.Screen.width,UE.Screen.height) end
+            if __HSRMouseCapture(-16)==1 and state.playtoolsPageOpen and state.settingsLeave then
+                state.settingsLeave()
+            end
             updateTransitions()
             if state.consoleDirty and state.consoleRefresh and not state.uiTransitions then pcall(state.consoleRefresh) end
             if state.layoutPage~=page or state.layoutWidth~=UE.Screen.width or state.layoutHeight~=UE.Screen.height then

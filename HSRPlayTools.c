@@ -139,6 +139,8 @@ static void (*original_scroll_delta)(HSRFloat2 *);
 /* Cursor capture and focus lifecycle. */
 /* Focus-scoped macOS relative mouse capture for the iOS native PC controls. */
 static void reset_input_keys(void);
+static void clear_panel_keys(void);
+static bool panel_keyboard_blocked, panel_escape_pending, panel_escape_held;
 static bool capture_requested, capture_active, capture_feature_enabled;
 static bool capture_api_ready;
 static bool capture_waits_for_alt=true;
@@ -218,6 +220,7 @@ static bool native_app_focused(void) {
 
 static bool native_alt_released(void) {
     bool held = native_alt_held(), focused = native_app_focused();
+    if (panel_keyboard_blocked) { alt_physical_previous=held; return true; }
     if (!focused) capture_waits_for_alt = true;
     if (capture_waits_for_alt) {
         bool pressed = focused && held && !alt_physical_previous;
@@ -314,6 +317,20 @@ static bool scene_mouse_passthrough;
 static int mouse_capture(lua_State *L) {
     int valid = 0;
     double requested = tonumberx(L, 1, &valid);
+    if (valid && (requested==-14 || requested==-15)) {
+        bool blocked=requested==-14;
+        if (blocked!=panel_keyboard_blocked) clear_panel_keys();
+        panel_keyboard_blocked=blocked;
+        panel_escape_pending=false;
+        alt_physical_previous=native_alt_held();
+        if (blocked) { capture_requested=false; release_mouse_capture(); }
+        return 0;
+    }
+    if (valid && requested==-16) {
+        pushnumber(L,panel_escape_pending?1:0);
+        panel_escape_pending=false;
+        return 1;
+    }
     if (valid && requested==-13) {
         pushnumber(L,(double)ui_left_press);
         pushnumber(L,(double)ui_left_release);
@@ -335,6 +352,9 @@ static int mouse_capture(lua_State *L) {
         return 1;
     }
     if (valid && requested==-10) {
+        panel_keyboard_blocked=false;
+        panel_escape_pending=false;
+        clear_panel_keys();
         capture_requested=false;
         capture_waits_for_alt=true;
         alt_release_latched=false;
@@ -401,6 +421,13 @@ static void set_input_key(int key, bool down) {
 static void reset_input_keys(void) {
     for (int i=1;i<512;i++) set_input_key(i, false);
 }
+static void clear_panel_keys(void) {
+    memset(key_held,0,323*sizeof(*key_held));
+    memset(key_pending_down,0,323*sizeof(*key_pending_down));
+    memset(key_pending_up,0,323*sizeof(*key_pending_up));
+    memset(key_down_frame,0,323*sizeof(*key_down_frame));
+    memset(key_up_frame,0,323*sizeof(*key_up_frame));
+}
 static void sample_key_edges(void) {
     int frame = unity_frame_count ? unity_frame_count() : -1;
     if (frame == key_sample_frame) return;
@@ -426,9 +453,9 @@ static bool input_value(int key, int kind) {
     }
     return kind==0 ? key_held[key] : kind==1 ? key_down_frame[key] : key_up_frame[key];
 }
-static bool native_key_held(int key) { return managed_key(key) ? input_value(key,0) : original_key_held(key); }
-static bool native_key_down(int key) { return managed_key(key) ? input_value(key,1) : original_key_down(key); }
-static bool native_key_up(int key) { return managed_key(key) ? input_value(key,2) : original_key_up(key); }
+static bool native_key_held(int key) { if (panel_keyboard_blocked && (key<323 || key>325)) return false; return managed_key(key) ? input_value(key,0) : original_key_held(key); }
+static bool native_key_down(int key) { if (panel_keyboard_blocked && (key<323 || key>325)) return false; return managed_key(key) ? input_value(key,1) : original_key_down(key); }
+static bool native_key_up(int key) { if (panel_keyboard_blocked && (key<323 || key>325)) return false; return managed_key(key) ? input_value(key,2) : original_key_up(key); }
 static bool native_button_held(int key) {
     if (key == 1) return input_value(324,0);
     if (scene_mouse_passthrough && !capture_active) return native_app_focused() && original_button_held(key);
@@ -493,6 +520,7 @@ static float mouse_axis_value(int axis) {
 static float native_axis_raw(void *name) {
     float original = original_axis_raw(name);
     int axis = mouse_axis_name(name);
+    if (panel_keyboard_blocked && axis!=3) return 0;
     if (axis && axis<=2 && warp_motion_suppressed()) return 0;
     return axis && fabsf(original) < 0.00001f ? mouse_axis_value(axis) : original;
 }
@@ -500,6 +528,7 @@ static float native_axis_raw(void *name) {
 static float native_axis(void *name) {
     float original = original_axis(name);
     int axis = mouse_axis_name(name);
+    if (panel_keyboard_blocked && axis!=3) return 0;
     if (axis && axis<=2 && warp_motion_suppressed()) return 0;
     return axis && fabsf(original) < 0.00001f ? mouse_axis_value(axis) : original;
 }
@@ -553,6 +582,18 @@ static bool install_mouse_bridge(void) {
             if (type==1) ui_left_press++;
             if (type==2) ui_left_release++;
         }
+        if (type==10 || type==11) {
+            unsigned short key=((unsigned short (*)(id,SEL))objc_msgSend)(event,sel_registerName("keyCode"));
+            if (key==53 && panel_escape_held) {
+                if (type==11) panel_escape_held=false;
+                return nil;
+            }
+            if (panel_keyboard_blocked) {
+                if (key==53 && type==10) { panel_escape_pending=true; panel_escape_held=true; }
+                return nil;
+            }
+        }
+        if (panel_keyboard_blocked && type==12) return nil;
         if (type == 12 || type == 10 || type == 11) {
             if (native_alt_released() || !native_app_focused()) release_mouse_capture();
             if (type == 10) {
