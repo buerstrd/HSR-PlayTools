@@ -854,6 +854,12 @@ if type(rawget(_G,"__HSRNativeInputFrame"))~="function" then
             end
             local immersive = world and cursor and not cursor.UseCursorMode
                 and not alt and not tabWheel and not (state.uiPointerGesture or overScroll) and module and not module.IsShowSDKUI
+            -- Lock before capture can recenter, rather than one frame later.
+            local _,wasCaptured=__HSRMouseCapture(-1)
+            if immersive and wasCaptured~=1 and not state.avatarRotationBlocked then
+                require("Logic.NotifyManager").notify(CS.RPG.Client.NotifyType.UIUnLockCameraRotation,false)
+                state.avatarRotationBlocked=true
+            end
             local _, captured = __HSRMouseCapture(immersive and 1 or 0)
             -- The retained NSCursor survives game asset and Lua context teardown.
             -- Query that owner before attempting another texture conversion.

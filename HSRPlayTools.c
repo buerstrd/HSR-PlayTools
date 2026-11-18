@@ -127,6 +127,8 @@ static double mouse_frame_x, mouse_frame_y, mouse_frame_wx, mouse_frame_wy;
 static double mouse_window_x, mouse_window_y;
 static double mouse_screen_width = 3840, mouse_screen_height = 2160;
 static int mouse_frame = -1;
+static bool ui_left_held;
+static int capture_ready_frame=-1;
 static bool (*original_cursor_visible)(void);
 static int (*original_cursor_lock)(void);
 
@@ -148,6 +150,7 @@ static bool initial_world_capture_used;
 static id game_system_cursor;
 static bool system_cursor_enabled;
 static double warp_motion_until;
+static bool mouse_rebase_pending;
 static bool warp_motion_suppressed(void) {
     return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1e9 < warp_motion_until;
 }
@@ -248,6 +251,7 @@ static void center_mouse_cursor(void) {
     id primary=((id (*)(id,SEL,unsigned long))objc_msgSend)(screens,sel_registerName("objectAtIndex:"),0);
     CGRect frame=((CGRect (*)(id,SEL))objc_msgSend)(primary,sel_registerName("frame"));
     point.y=frame.origin.y+frame.size.height-point.y;
+    mouse_rebase_pending=true;
     warp_motion_until=clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1e9+0.06;
     mouse_pending_x=mouse_pending_y=mouse_frame_x=mouse_frame_y=0;
     mouse_window_x=mouse_screen_width/2; mouse_window_y=mouse_screen_height/2;
@@ -267,8 +271,14 @@ static void update_mouse_capture(void) {
     bool focused = native_app_focused();
     bool alt = native_alt_released();
     bool engage = capture_requested && focused && !alt;
-    if (!engage) { release_mouse_capture(); return; }
+    if (!engage) { capture_ready_frame=-1; release_mouse_capture(); return; }
     if (capture_active || !capture_api_ready) return;
+    /* Allow the UI release/touch-end to finish before recentering. */
+    if (ui_left_held) { capture_ready_frame=-1; return; }
+    int frame=unity_frame_count ? unity_frame_count() : -1;
+    if (capture_ready_frame<0) { capture_ready_frame=frame; return; }
+    if (frame<=capture_ready_frame+1) return;
+    capture_ready_frame=-1;
     center_mouse_cursor();
     int result = associate_mouse_cursor(false);
     if (result != 0) {
@@ -419,6 +429,8 @@ static void set_input_key(int key, bool down) {
     if (down) key_pending_down[key] = true; else key_pending_up[key] = true;
 }
 static void reset_input_keys(void) {
+    ui_left_held=false;
+    capture_ready_frame=-1;
     for (int i=1;i<512;i++) set_input_key(i, false);
 }
 static void clear_panel_keys(void) {
@@ -483,7 +495,9 @@ static void mouse_sample_frame(void) {
     int frame = unity_frame_count ? unity_frame_count() : -1;
     if (frame == mouse_frame) return;
     mouse_frame = frame;
-    mouse_frame_x = mouse_pending_x; mouse_frame_y = mouse_pending_y;
+    bool suppress=warp_motion_suppressed();
+    mouse_frame_x = suppress ? 0 : mouse_pending_x;
+    mouse_frame_y = suppress ? 0 : mouse_pending_y;
     mouse_frame_wx = mouse_pending_wx; mouse_frame_wy = mouse_pending_wy;
     mouse_pending_x = mouse_pending_y = mouse_pending_wx = mouse_pending_wy = 0;
 }
@@ -518,18 +532,30 @@ static float mouse_axis_value(int axis) {
 }
 
 static float native_axis_raw(void *name) {
-    float original = original_axis_raw(name);
     int axis = mouse_axis_name(name);
     if (panel_keyboard_blocked && axis!=3) return 0;
     if (axis && axis<=2 && warp_motion_suppressed()) return 0;
+    if (axis && axis<=2 && capture_feature_enabled) {
+        if (capture_active) return mouse_axis_value(axis);
+        /* Free-pointer motion is UI input; only a held-button drag owns
+         * camera axes. Do not leave idle UI movement in the game's axes. */
+        if (!ui_left_held) return 0;
+    }
+    float original = original_axis_raw(name);
     return axis && fabsf(original) < 0.00001f ? mouse_axis_value(axis) : original;
 }
 
 static float native_axis(void *name) {
-    float original = original_axis(name);
     int axis = mouse_axis_name(name);
     if (panel_keyboard_blocked && axis!=3) return 0;
     if (axis && axis<=2 && warp_motion_suppressed()) return 0;
+    if (axis && axis<=2 && capture_feature_enabled) {
+        if (capture_active) return mouse_axis_value(axis);
+        /* Free-pointer motion is UI input; only a held-button drag owns
+         * camera axes. Do not leave idle UI movement in the game's axes. */
+        if (!ui_left_held) return 0;
+    }
+    float original = original_axis(name);
     return axis && fabsf(original) < 0.00001f ? mouse_axis_value(axis) : original;
 }
 
@@ -543,7 +569,7 @@ static int native_cursor_lock(void) {
 static void native_mouse_position(HSRFloat3 *out) {
     original_mouse_position(out);
     if (capture_active) {
-        out->x = (float)(mouse_screen_width / 2); out->y = (float)(mouse_screen_height / 2); out->z = 0;
+        out->x=(float)(mouse_screen_width/2); out->y=(float)(mouse_screen_height/2); out->z=0;
     } else if (mouse_position_valid) {
         out->x = (float)mouse_window_x; out->y = (float)mouse_window_y; out->z = 0;
     }
@@ -578,9 +604,23 @@ static bool install_mouse_bridge(void) {
     id (^handler)(id) = ^id(id event) {
         unsigned long type = ((unsigned long (*)(id, SEL))objc_msgSend)(event, sel_registerName("type"));
         id window = ((id (*)(id, SEL))objc_msgSend)(event, sel_registerName("window"));
+        /* Consume recenter movement before UIKit/PlayCover can turn it into
+         * mouse or touch input. Button releases still pass through normally. */
+        if ((type==5 || type==6 || type==7 || type==27) && warp_motion_suppressed()) {
+            mouse_pending_x=mouse_pending_y=mouse_frame_x=mouse_frame_y=0;
+            return nil;
+        }
+        /* A warp can leave the first physical event's relative delta based
+         * on the old location even after the timed suppression has elapsed. */
+        if ((type==5 || type==6 || type==7 || type==27) && mouse_rebase_pending) {
+            mouse_rebase_pending=false;
+            mouse_pending_x=mouse_pending_y=mouse_frame_x=mouse_frame_y=0;
+            return nil;
+        }
+        if (type==2) ui_left_held=false;
         if (window && native_app_focused()) {
-            if (type==1) ui_left_press++;
-            if (type==2) ui_left_release++;
+            if (type==1) { ui_left_press++; ui_left_held=true; }
+            if (type==2) { ui_left_release++; ui_left_held=false; }
         }
         if (type==10 || type==11) {
             unsigned short key=((unsigned short (*)(id,SEL))objc_msgSend)(event,sel_registerName("keyCode"));
@@ -657,9 +697,12 @@ static bool install_mouse_bridge(void) {
         } else if (type == 5 || type == 6 || type == 7 || type == 27) {
             double x = ((double (*)(id, SEL))objc_msgSend)(event, sel_registerName("deltaX"));
             double y = ((double (*)(id, SEL))objc_msgSend)(event, sel_registerName("deltaY"));
-            if (!warp_motion_suppressed() && isfinite(x) && isfinite(y)) {
+            if (capture_active && !warp_motion_suppressed() && isfinite(x) && isfinite(y)) {
                 mouse_pending_x += x * 0.1 * mouse_sensitivity; mouse_pending_y -= y * 0.1 * mouse_sensitivity;
             }
+            /* Captured motion has one owner: the relative-axis bridge above.
+             * Do not also let the platform translate it into a touch drag. */
+            if (capture_active) return nil;
         }
         return event;
     };
