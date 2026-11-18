@@ -74,7 +74,7 @@ local function updateAvatarScrolls(page)
         if go then state.avatarScrollRects=go:GetComponentsInChildren(typeof(UE.UI.ScrollRect),false) end
     end
 end
-local function transition(object,visible)
+local function transition(object,visible,finished)
     if not object or object:Equals(nil) then return end
     local group=object:GetComponent(typeof(UE.CanvasGroup))
     if not group then
@@ -83,9 +83,14 @@ local function transition(object,visible)
     end
     group.interactable=visible
     group.blocksRaycasts=visible
+    local wasActive=object.activeSelf
     if visible then object:SetActive(true) end
+    local transform=object.transform
+    local scale=wasActive and transform.localScale.x or 0.97
+    if not visible and wasActive then group.alpha=1 end
     state.uiTransitions=state.uiTransitions or {}
-    state.uiTransitions[object]={group=group,from=group.alpha,to=visible and 1 or 0,time=0}
+    state.uiTransitions[object]={group=group,transform=transform,from=group.alpha,to=visible and 1 or 0,
+        scale=scale,started=UE.Time.unscaledTime,finished=finished}
 end
 local function canvasCamera(object)
     local canvas=object:GetComponentInParent(typeof(UE.Canvas))
@@ -104,29 +109,46 @@ local function updateEntryHover(page,module)
         hovered=UE.RectTransformUtility.RectangleContainsScreenPoint(entryRect,point,camera)
             and (not state.menuViewport or UE.RectTransformUtility.RectangleContainsScreenPoint(state.menuViewport,point,camera))
     end
-    local opacity=hovered and 0.2 or 0
+    local opacity=hovered and 0.08 or 0
     state.entryHoverAlpha=UE.Mathf.MoveTowards(state.entryHoverAlpha or 0,opacity,
-        UE.Time.unscaledDeltaTime*0.2/state.entryHoverDuration)
+        UE.Time.unscaledDeltaTime*0.08/state.entryHoverDuration)
     image.gameObject:SetActive(true)
     image.color=UE.Color(1,1,1,state.entryHoverAlpha)
 end
 local function updateTransitions()
     if not state.uiTransitions then return end
-    local delta=math.max(0,UE.Time.unscaledDeltaTime)
+    local now=UE.Time.unscaledTime
+    local completed
     for object,animation in pairs(state.uiTransitions) do
         if object:Equals(nil) or animation.group:Equals(nil) then
             state.uiTransitions[object]=nil
         else
-            animation.time=math.min(0.18,animation.time+delta)
-            local t=animation.time/0.18
+            local t=math.max(0,math.min(1,(now-animation.started)/0.1))
             local eased=t*t*(3-2*t)
-            animation.group.alpha=animation.from+(animation.to-animation.from)*eased
+            local targetScale=animation.to==1 and 1 or 0.97
+            local scale=animation.scale+(targetScale-animation.scale)*eased
+            animation.transform.localScale=UE.Vector3(scale,scale,1)
+            -- Keep the closing surface opaque so overlapping slider graphics
+            -- cannot linger through independently blended transparent layers.
+            if animation.to==1 then
+                animation.group.alpha=animation.from+(1-animation.from)*eased
+            end
             if t>=1 then
-                if animation.to==0 then object:SetActive(false) end
+                if animation.to==0 then
+                    object:SetActive(false)
+                    animation.group.alpha=0
+                    animation.transform.localScale=UE.Vector3(1,1,1)
+                end
                 state.uiTransitions[object]=nil
+                if animation.finished then
+                    completed=completed or {}
+                    table.insert(completed,animation.finished)
+                end
             end
         end
     end
+    if not next(state.uiTransitions) then state.uiTransitions=nil end
+    if completed then for _,finished in ipairs(completed) do finished() end end
 end
 -- One owner and one cleanup path for the menu entry and independent overlay.
 local function disposeSettings()
@@ -140,6 +162,7 @@ local function disposeSettings()
     state.entryHoverAlpha=nil
     state.entryHoverDuration=nil
     state.menuViewport=nil
+    state.settingsMenu=nil
     for _,key in ipairs({"settingsRoot","settingsTab"}) do
         local object=state[key]
         if object then pcall(function()
@@ -272,6 +295,8 @@ local function updateSettings()
             control.fillRect = fill.transform
             control.handleRect = handle.transform
             control.targetGraphic = handleImage
+            -- Only the panel controls fading; slider state changes are immediate.
+            control.transition = UE.UI.Selectable.Transition.None
             control.direction = UE.UI.Slider.Direction.LeftToRight
             control.minValue = 0
             control.maxValue = math.floor((maximum-minimum)/step+0.5)
@@ -280,8 +305,19 @@ local function updateSettings()
             control.onValueChanged:AddListener(function(v) changed(minimum+v*step) end)
             return text
         end
+        local function panelShadow(object)
+            local shadow=object:AddComponent(typeof(UE.UI.Shadow))
+            shadow.effectColor=UE.Color(0,0,0,0.3)
+            shadow.effectDistance=UE.Vector2(8,-10)
+            shadow.useGraphicAlpha=true
+        end
+        local function switchPanel(previous,nextPanel)
+            nextPanel:SetActive(false)
+            transition(previous,false,function() transition(nextPanel,true) end)
+        end
         local panel = rect("Page", created.transform, 0, 0, 660, 780)
         panel:AddComponent(typeof(UE.UI.Image)).color = UE.Color(0.82, 0.82, 0.82, 1)
+        panelShadow(panel)
         label(rect("Title", panel.transform, 0, 350, 440, 50), "HSR PlayTools 设置")
         local scale, sensitivity, wheelSensitivity, altMode
         local function refresh()
@@ -327,21 +363,22 @@ local function updateSettings()
         state.altPressSeen,state.altReleaseSeen=__HSRMouseCapture(-13)
         local console = rect("UnityConsole", created.transform, 0, 0, 1500, 850)
         console:AddComponent(typeof(UE.UI.Image)).color = UE.Color(0.9, 0.9, 0.9, 1)
-        local outputArea = rect("Output", console.transform, 0, 35, 1400, 650)
+        panelShadow(console)
+        local outputArea = rect("Output", console.transform, 0, 10, 1400, 640)
         outputArea:AddComponent(typeof(UE.UI.Image)).color = UE.Color(0.98, 0.98, 0.98, 1)
         outputArea:AddComponent(typeof(UE.UI.RectMask2D))
-        local content=rect("Content",outputArea.transform,0,0,1400,650).transform
+        local content=rect("Content",outputArea.transform,0,0,1400,640).transform
         content.anchorMin=UE.Vector2(0,1)
         content.anchorMax=UE.Vector2(1,1)
         content.pivot=UE.Vector2(0.5,1)
         content.anchoredPosition=UE.Vector2(0,0)
-        content.sizeDelta=UE.Vector2(0,650)
+        content.sizeDelta=UE.Vector2(0,640)
         local output = label(content.gameObject, "")
         output.rectTransform.anchorMin=UE.Vector2(0,1)
         output.rectTransform.anchorMax=UE.Vector2(1,1)
         output.rectTransform.pivot=UE.Vector2(0.5,1)
         output.rectTransform.anchoredPosition=UE.Vector2(0,-12)
-        output.rectTransform.sizeDelta=UE.Vector2(-24,626)
+        output.rectTransform.sizeDelta=UE.Vector2(-24,616)
         output.alignment = UE.TextAnchor.UpperLeft
         output.fontSize = 17
         output.supportRichText=false
@@ -375,13 +412,11 @@ local function updateSettings()
             console:SetActive(true)
             refreshConsole(firstOpen)
             console.transform:SetAsLastSibling()
-            transition(panel,false)
-            transition(console,true)
+            switchPanel(panel,console)
         end
         button(panel.transform, "打开 Unity 控制台", 0, -170, showConsole)
         closeButton(console.transform,700,380, function()
-            transition(console,false)
-            transition(panel,true)
+            switchPanel(console,panel)
         end)
         button(console.transform, "清空", 0, -365, function()
             state.consoleLines={}
@@ -438,24 +473,22 @@ local function updateSettings()
         state.entryHoverAlpha=0
         state.entryHoverDuration=math.max(0.08,nativeButton.colors.fadeDuration)
         state.settingsTab=tab
-        -- Reuse the game's own monochrome settings sprite and grid outline.
+        -- Keep the native grid outline around the HSRP letter icon.
         local menuImages=menu:GetComponentsInChildren(typeof(UE.UI.Image),true)
-        local gearSprite, outlineSprite, outlineColor
+        local outlineSprite, outlineColor
         for i=0,menuImages.Length-1 do
             local image=menuImages[i]
             if image.sprite then
-                if image.sprite.name=="SetIcon" then gearSprite=image.sprite end
                 if image.sprite.name=="Outline2px" and not outlineSprite then
                     outlineSprite,outlineColor=image.sprite,image.color
                 end
             end
         end
-        if not gearSprite then error("Native settings icon unavailable") end
-        local icon=rect("PlayToolsIcon",tr,0,13,100,100):AddComponent(typeof(UE.UI.Image))
-        icon.sprite=gearSprite
-        icon.preserveAspect=true
+        local icon=label(rect("PlayToolsIcon",tr,0,13,88,48),"HSR+")
+        icon.rectTransform.sizeDelta=UE.Vector2(88,48)
+        icon.fontSize=28
+        icon.fontStyle=UE.FontStyle.Bold
         icon.color=UE.Color(1,1,1,1)
-        icon.raycastTarget=false
         if outlineSprite then
             local border=rect("PlayToolsBorder",tr,0,0,96,96):AddComponent(typeof(UE.UI.Image))
             border.sprite=outlineSprite
@@ -463,12 +496,20 @@ local function updateSettings()
             border.color=outlineColor
             border.raycastTarget=false
         end
-        local caption = label(rect("PlayToolsCaption", tr, 0, -28, 94, 28), "HSR PlayTools")
-        caption.fontSize = 12
-        caption.rectTransform.sizeDelta=UE.Vector2(92,28)
-        caption.resizeTextForBestFit=true
-        caption.resizeTextMinSize=9
-        caption.resizeTextMaxSize=12
+        local caption = label(rect("PlayToolsCaption", tr, 0, -28, 94, 28), "增强工具")
+        caption.fontSize = 14
+        caption.rectTransform.sizeDelta=UE.Vector2(94,28)
+        caption.resizeTextForBestFit=false
+        local nativeLabels=template:GetComponentsInChildren(typeof(UE.UI.Text),true)
+        for i=0,nativeLabels.Length-1 do
+            local native=nativeLabels[i]
+            if native.text and native.text~="" then
+                caption.font=native.font
+                caption.fontSize=native.fontSize
+                caption.fontStyle=native.fontStyle
+                break
+            end
+        end
         caption.color = UE.Color(1,1,1,1)
         local scroll=appList:GetComponentInParent(typeof(UE.UI.ScrollRect))
         state.menuViewport=scroll and scroll.viewport or appList.parent
@@ -502,6 +543,7 @@ local function updateSettings()
         panel:SetActive(false)
         created.transform:SetAsLastSibling()
         state.settingsRoot = created
+        state.settingsMenu = menu
     end)
     if not success then
         if created then created:SetActive(false); UE.Object.Destroy(created) end
@@ -581,7 +623,6 @@ applyUIScale()
 -- Use the native cursor controller for Alt/UI state; macOS capture supplies
 -- relative movement where iOS Cursor.lockState is ineffective.
 if type(rawget(_G,"__HSRNativeInputFrame"))~="function" then
-    local process, args
     rawset(_G, "__HSRNativeInputFrame", function()
         if not __HSRMouseCapture then return end
         local ok = pcall(function()
@@ -615,7 +656,6 @@ if type(rawget(_G,"__HSRNativeInputFrame"))~="function" then
                     end
                 end)
                 disposeSettings()
-                process,args=nil,nil
                 state.cursorEvent=nil
                 state.cursorHits=nil
                 state.pointerHoverMethod=nil
@@ -651,7 +691,7 @@ if type(rawget(_G,"__HSRNativeInputFrame"))~="function" then
             end
             if __HSRMouseDimensions then __HSRMouseDimensions(UE.Screen.width,UE.Screen.height) end
             updateTransitions()
-            if state.consoleDirty and state.consoleRefresh then pcall(state.consoleRefresh) end
+            if state.consoleDirty and state.consoleRefresh and not state.uiTransitions then pcall(state.consoleRefresh) end
             if state.layoutPage~=page or state.layoutWidth~=UE.Screen.width or state.layoutHeight~=UE.Screen.height then
                 applyUIScale()
                 updateAvatarScrolls(page)
@@ -665,8 +705,8 @@ if type(rawget(_G,"__HSRNativeInputFrame"))~="function" then
                 (not state.settingsTab or state.settingsTab:Equals(nil))
             local menuHidden=false
             if state.settingsRoot then
-                local menu=UE.GameObject.Find("MobilePhoneMainPage(Clone)")
-                menuHidden=not menu or not menu.activeInHierarchy
+                local menu=state.settingsMenu
+                menuHidden=not menu or menu:Equals(nil) or not menu.activeInHierarchy
             end
             if state.settingsFramePage~=page or missingMenuEntry or menuHidden then
                 local ready,reason=pcall(updateSettings)
@@ -895,6 +935,34 @@ if type(rawget(_G,"__HSRNativeInputFrame"))~="function" then
                     state.pointerHoverMethod:Invoke(module,CS.System.Reflection.BindingFlags.Default,nil,state.pointerHoverArgs,nil)
 
                 end
+                -- Bridge only scrolling. Re-running ProcessMouseEvent also
+                -- dispatches button edges already handled by the game's input.
+                local wheel=UE.Input.mouseScrollDelta
+                if target and module and module.isActiveAndEnabled and (wheel.x~=0 or wheel.y~=0) then
+                    local contract=typeof(UE.EventSystems.IScrollHandler)
+                    if not state.scrollMethod then
+                        state.scrollMethod=contract:GetMethod("OnScroll")
+                        state.scrollArgs=CS.System.Array.CreateInstance(typeof(CS.System.Object),1)
+                    end
+                    state.cursorEvent.scrollDelta=wheel
+                    state.scrollArgs[0]=state.cursorEvent
+                    local node=target.transform
+                    while node do
+                        local handled=false
+                        local handlers=node:GetComponents(typeof(UE.Component))
+                        for j=0,handlers.Length-1 do
+                            local handler=handlers[j]
+                            if handler and contract:IsAssignableFrom(handler:GetType())
+                                and (not typeof(UE.Behaviour):IsAssignableFrom(handler:GetType()) or handler.isActiveAndEnabled) then
+                                state.scrollMethod:Invoke(handler,CS.System.Reflection.BindingFlags.Default,nil,state.scrollArgs,nil)
+                                handled=true
+                            end
+                        end
+                        if handled then break end
+                        node=node.parent
+                    end
+                    state.scrollArgs[0]=nil
+                end
                 if current then
                     local candidate=nil
                     if target and visible and not nativeHoverButton then
@@ -935,21 +1003,6 @@ if type(rawget(_G,"__HSRNativeInputFrame"))~="function" then
                 if ui then ui:UpdateCursorState() end
                 UE.Cursor.visible=showGameCursor
                 state.gameCursorVisible=showGameCursor
-            end
-            local wheel = UE.Input.mouseScrollDelta
-            if module and module.isActiveAndEnabled and (captured~=1 or (wheel.x~=0 or wheel.y~=0)) then
-                if not process then
-                    local flags = CS.System.Enum.Parse(typeof(CS.System.Reflection.BindingFlags), "Instance, Public, NonPublic")
-                    local methods = module:GetType():GetMethods(flags)
-                    for i = 0, methods.Length - 1 do
-                        local m = methods[i]
-                        if m.Name == "ProcessMouseEvent" and m:GetParameters().Length == 0 then process = m; break end
-                    end
-                    args = CS.System.Array.CreateInstance(typeof(CS.System.Object), 0)
-                end
-                if process then
-                    process:Invoke(module, CS.System.Reflection.BindingFlags.Default, nil, args, nil)
-                end
             end
             pcall(function()
                 local button=state.pendingHoverAnimator

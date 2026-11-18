@@ -417,7 +417,8 @@ static bool managed_key(int key) {
 static bool input_value(int key, int kind) {
     sample_key_edges();
     if (!native_app_focused()) return false;
-    if (key>=323 && key<=325 && (!capture_active || native_alt_released())) return false;
+    /* Right-button actions remain available in UI and minigames without capture. */
+    if ((key==323 || key==325) && (!capture_active || native_alt_released())) return false;
     if (key<=0 || key>=512) return false;
     if (key == 304 && !scene_mouse_passthrough) {
         bool sprint = kind==0 ? key_held[324] : kind==1 ? key_down_frame[324] : key_up_frame[324];
@@ -429,14 +430,17 @@ static bool native_key_held(int key) { return managed_key(key) ? input_value(key
 static bool native_key_down(int key) { return managed_key(key) ? input_value(key,1) : original_key_down(key); }
 static bool native_key_up(int key) { return managed_key(key) ? input_value(key,2) : original_key_up(key); }
 static bool native_button_held(int key) {
+    if (key == 1) return input_value(324,0);
     if (scene_mouse_passthrough && !capture_active) return native_app_focused() && original_button_held(key);
     return key>=0 && key<=2 ? input_value(323+key,0) : original_button_held(key);
 }
 static bool native_button_down(int key) {
+    if (key == 1) return input_value(324,1);
     if (scene_mouse_passthrough && !capture_active) return native_app_focused() && original_button_down(key);
     return key>=0 && key<=2 ? input_value(323+key,1) : original_button_down(key);
 }
 static bool native_button_up(int key) {
+    if (key == 1) return input_value(324,2);
     if (scene_mouse_passthrough && !capture_active) return native_app_focused() && original_button_up(key);
     return key>=0 && key<=2 ? input_value(323+key,2) : original_button_up(key);
 }
