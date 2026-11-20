@@ -120,6 +120,7 @@ static unsigned long ui_left_press,ui_left_release;
 
 typedef struct { float x, y; } HSRFloat2;
 typedef struct { float x, y, z; } HSRFloat3;
+typedef struct { float x, y, z, w; } HSRQuaternion;
 static id mouse_monitor;
 static bool mouse_bridge_active, mouse_position_valid;
 static double mouse_pending_x, mouse_pending_y, mouse_pending_wx, mouse_pending_wy;
@@ -136,6 +137,11 @@ static int (*unity_frame_count)(void);
 static float (*original_axis_raw)(void *);
 static float (*original_axis)(void *);
 static void (*original_mouse_position)(HSRFloat3 *);
+static void (*original_gyro_gravity)(int, HSRFloat3 *);
+static void (*original_gyro_attitude)(int, HSRQuaternion *);
+static bool gyro_pointer_active, gyro_pointer_inside;
+static CGPoint gyro_pointer_position;
+static HSRQuaternion gyro_pointer_tilt;
 static void (*original_scroll_delta)(HSRFloat2 *);
 
 /* Cursor capture and focus lifecycle. */
@@ -212,13 +218,19 @@ static bool native_alt_held(void) {
     return (flags & (1UL << 19)) != 0; /* NSEventModifierFlagOption */
 }
 
-static bool native_app_focused(void) {
+static id native_focused_window(void) {
     Class app_class = objc_getClass("NSApplication");
-    if (!app_class) return false;
+    if (!app_class) return nil;
     id app = ((id (*)(id, SEL))objc_msgSend)((id)app_class, sel_registerName("sharedApplication"));
     bool active = ((bool (*)(id, SEL))objc_msgSend)(app, sel_registerName("isActive"));
-    id window = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("keyWindow"));
-    return active && window != nil;
+    return active ? ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("keyWindow")) : nil;
+}
+
+static bool native_app_focused(void) { return native_focused_window() != nil; }
+
+static int window_focused(lua_State *L) {
+    pushnumber(L, native_app_focused() ? 1 : 0);
+    return 1;
 }
 
 static bool native_alt_released(void) {
@@ -575,6 +587,138 @@ static void native_mouse_position(HSRFloat3 *out) {
     }
 }
 
+static bool use_gyro_pointer(void) {
+    return pthread_main_np() && gyro_pointer_active && !capture_active && !panel_keyboard_blocked;
+}
+
+static void native_gyro_gravity(int index, HSRFloat3 *out) {
+    original_gyro_gravity(index, out);
+    if (!use_gyro_pointer()) return;
+
+    // Rotate the device-space gravity vector by the synthetic tilt.
+    HSRQuaternion tilt = gyro_pointer_tilt;
+    float x = 2 * tilt.y * out->z;
+    float y = -2 * tilt.x * out->z;
+    float z = 2 * (tilt.x * out->y - tilt.y * out->x);
+    out->x += tilt.w * x + tilt.y * z;
+    out->y += tilt.w * y - tilt.x * z;
+    out->z += tilt.w * z + tilt.x * y - tilt.y * x;
+}
+
+static void native_gyro_attitude(int index, HSRQuaternion *out) {
+    original_gyro_attitude(index, out);
+    if (!use_gyro_pointer()) return;
+
+    // Apply the inverse device-space tilt to the device attitude.
+    HSRQuaternion tilt = gyro_pointer_tilt;
+    *out = (HSRQuaternion){
+        out->x * tilt.w - out->w * tilt.x + out->z * tilt.y,
+        out->y * tilt.w - out->w * tilt.y - out->z * tilt.x,
+        out->z * tilt.w - out->x * tilt.y + out->y * tilt.x,
+        out->w * tilt.w + out->x * tilt.x + out->y * tilt.y,
+    };
+}
+
+static void sample_gyro_pointer(void) {
+    id window = native_focused_window();
+    if (!window) return;
+    id view = ((id (*)(id, SEL))objc_msgSend)(window, sel_registerName("contentView"));
+    if (!view) return;
+    CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(view, sel_registerName("bounds"));
+    if (bounds.size.width <= 0 || bounds.size.height <= 0) return;
+
+    // AppKit can stop sending mouse-moved events as the pointer leaves.
+    CGPoint point = ((CGPoint (*)(id, SEL))objc_msgSend)
+        (window, sel_registerName("mouseLocationOutsideOfEventStream"));
+    point = ((CGPoint (*)(id, SEL, CGPoint, id))objc_msgSend)
+        (view, sel_registerName("convertPoint:fromView:"), point, nil);
+    double x = (point.x - bounds.origin.x) / bounds.size.width;
+    double y = (point.y - bounds.origin.y) / bounds.size.height;
+    bool inside = x >= 0 && x <= 1 && y >= 0 && y <= 1;
+
+    if (inside) {
+        gyro_pointer_position = (CGPoint){x, y};
+    } else if (gyro_pointer_inside) {
+        // Hold the first edge crossed, even when a fast move skips past it.
+        double dx = x - gyro_pointer_position.x;
+        double dy = y - gyro_pointer_position.y;
+        double t = 1;
+        if (x < 0) t = fmin(t, -gyro_pointer_position.x / dx);
+        if (x > 1) t = fmin(t, (1 - gyro_pointer_position.x) / dx);
+        if (y < 0) t = fmin(t, -gyro_pointer_position.y / dy);
+        if (y > 1) t = fmin(t, (1 - gyro_pointer_position.y) / dy);
+        gyro_pointer_position.x += t * dx;
+        gyro_pointer_position.y += t * dy;
+    }
+    gyro_pointer_inside = inside;
+}
+
+static int set_gyro_pointer(lua_State *L) {
+    int valid = 0;
+    double enabled = tonumberx(L, 1, &valid);
+    bool active = valid && enabled == 1;
+    if (active && !gyro_pointer_active) {
+        gyro_pointer_position = (CGPoint){0.5, 0.5};
+        gyro_pointer_inside = true;
+        gyro_pointer_tilt = (HSRQuaternion){.w = 1};
+    }
+    gyro_pointer_active = active;
+    if (active && !capture_active && !panel_keyboard_blocked && !warp_motion_suppressed()) {
+        sample_gyro_pointer();
+        double x = 2 * gyro_pointer_position.x - 1;
+        double y = 2 * gyro_pointer_position.y - 1;
+        double length = hypot(x, y);
+        if (length == 0) {
+            gyro_pointer_tilt = (HSRQuaternion){.w = 1};
+        } else {
+            // One rotation reaches the same 90-degree limit at edges and corners.
+            double half_angle = (M_PI_2 / 2) * fmax(fabs(x), fabs(y));
+            double scale = sin(half_angle) / length;
+            gyro_pointer_tilt = (HSRQuaternion){(float)(y * scale), (float)(-x * scale), 0,
+                                               (float)cos(half_angle)};
+        }
+    }
+    return 0;
+}
+
+typedef struct HSRGyroDecision {
+    struct HSRGyroDecision *next;
+    size_t source_length;
+    int decision;
+    char source[];
+} HSRGyroDecision;
+
+/* Remembers decisions across Lua reloads for the life of this game process. */
+static HSRGyroDecision *gyro_decisions;
+
+static int gyro_decision(lua_State *L) {
+    size_t length = 0;
+    const char *source = tolstring(L, 1, &length);
+    if (!source || !length) return 0;
+
+    HSRGyroDecision *entry = gyro_decisions;
+    while (entry && (entry->source_length != length || memcmp(entry->source, source, length) != 0)) {
+        entry = entry->next;
+    }
+
+    int valid = 0;
+    double requested = tonumberx(L, 2, &valid);
+    if (valid && (requested == 1 || requested == -1)) {
+        if (!entry && length <= SIZE_MAX - sizeof(*entry)) {
+            entry = malloc(sizeof(*entry) + length);
+            if (entry) {
+                entry->source_length = length;
+                memcpy(entry->source, source, length);
+                entry->next = gyro_decisions;
+                gyro_decisions = entry;
+            }
+        }
+        if (entry) entry->decision = (int)requested;
+    }
+    pushnumber(L, entry ? entry->decision : 0);
+    return 1;
+}
+
 static void native_scroll_delta(HSRFloat2 *out) {
     original_scroll_delta(out);
     mouse_sample_frame();
@@ -736,6 +880,12 @@ static bool install_mouse_bridge(void) {
     __atomic_store_n((uintptr_t *)(table+0xdb0),(uintptr_t)native_button_held,__ATOMIC_RELEASE);
     __atomic_store_n((uintptr_t *)(table+0xdb8),(uintptr_t)native_button_down,__ATOMIC_RELEASE);
     __atomic_store_n((uintptr_t *)(table+0xdc0),(uintptr_t)native_button_up,__ATOMIC_RELEASE);
+    // UnityEngine.Gyroscope.gravity_Internal_Injected
+    original_gyro_gravity = (void *)*(uintptr_t *)(table + 0xd38);
+    __atomic_store_n((uintptr_t *)(table + 0xd38), (uintptr_t)native_gyro_gravity, __ATOMIC_RELEASE);
+    // UnityEngine.Gyroscope.attitude_Internal_Injected
+    original_gyro_attitude = (void *)*(uintptr_t *)(table + 0xd48);
+    __atomic_store_n((uintptr_t *)(table + 0xd48), (uintptr_t)native_gyro_attitude, __ATOMIC_RELEASE);
     install_cursor_capture();
     mouse_bridge_active = true;
     return true;
@@ -798,6 +948,12 @@ static void initialize_playtools(lua_State *L) {
     setglobal(L, "__HSRSensitivity");
     pushclosure(L, mouse_dimensions, "HSRMouseDimensions", 0, NULL);
     setglobal(L, "__HSRMouseDimensions");
+    pushclosure(L, set_gyro_pointer, "HSRGyroPointer", 0, NULL);
+    setglobal(L, "__HSRGyroPointer");
+    pushclosure(L, window_focused, "HSRWindowFocused", 0, NULL);
+    setglobal(L, "__HSRWindowFocused");
+    pushclosure(L, gyro_decision, "HSRGyroDecision", 0, NULL);
+    setglobal(L, "__HSRGyroDecision");
     pushclosure(L, mouse_capture, "HSRMouseCapture", 0, NULL);
     setglobal(L, "__HSRMouseCapture");
     pushclosure(L, system_cursor_image, "HSRCursorImage", 0, NULL);

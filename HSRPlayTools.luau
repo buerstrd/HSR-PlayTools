@@ -35,6 +35,115 @@ local explorationPages = {
     TrainMainPage = true,
 }
 
+-- ActivityPage hosts many separate requests. Only the selected Currency Wars
+-- background is known. Keep the page controller weakly while it is open.
+local activityView = setmetatable({}, {__mode = "v"})
+
+local function observeActivityPage()
+    local pageClass = require("Ui.Activity.ActivityPage")
+    local onLoad = pageClass._on_load
+    if type(onLoad) ~= "function" then return end
+    pageClass._on_load = function(self, ...)
+        activityView.controller = self
+        return onLoad(self, ...)
+    end
+end
+
+local function gyroRequestSource(page)
+    if page ~= "ActivityPage" then return page, false end
+
+    local controller = activityView.controller
+    if controller then
+        local ok, tab = pcall(controller._get_cur_activity_tab_item, controller)
+        if ok and type(tab) == "table" then
+            if tab.__name then return tostring(tab.__name), tab.__name == "GridFightActivityPanel" end
+            local hasID, panelID = pcall(function()
+                local data = tab._activity_panel_data or tab._activity_data
+                return data and data.PanelID
+            end)
+            return hasID and panelID and tostring(panelID) or page, false
+        end
+    end
+
+    -- Handles a page already open before the observer was installed.
+    local panel = UE.GameObject.Find("QuestGridFightPanel(Clone)")
+    return page, panel and not panel:Equals(nil)
+end
+
+-- In the PC layout, light-cone previews can be visible without a gyro request.
+local lightConePreviewPages = {
+    AvatarMainPage = true,
+    LightConeDetailPage = true,
+    LightConeReplacePage = true,
+    LightConeArchiveDetailPage = true,
+    LightConeZoomInPage = true,
+    GachaLightConeDetailPage = true,
+    NewLightConeDropDialog = true,
+}
+local lightConePanels = setmetatable({}, {__mode = "k"})
+local gyroLightConePanel
+
+local function observeLightConePreviews()
+    local panelClass = require("Ui.UI3DSystem.UI3DLightConePanel")
+    local setup = panelClass.setup_lightcone
+    local swipe = panelClass.swipe_lightcone
+    if type(setup) ~= "function" then return end
+    panelClass.setup_lightcone = function(panel, ...)
+        local results = table.pack(setup(panel, ...))
+        lightConePanels[panel] = true
+        return table.unpack(results, 1, results.n)
+    end
+    if type(swipe) == "function" then
+        -- Both pointer drag paths and the controller stick dispatch here.
+        panelClass.swipe_lightcone = function(panel, ...)
+            if panel == gyroLightConePanel then
+                local utils = G and G.Utils
+                if not (utils and utils.is_gamepad_input and utils.is_gamepad_input()) then return end
+            end
+            return swipe(panel, ...)
+        end
+    end
+    -- Model collider clicks and page-level taps can both trigger the preview.
+    for _, name in ipairs({"_on_click_light_cone", "simple_tap_lightcone"}) do
+        local click = panelClass[name]
+        if type(click) == "function" then
+            panelClass[name] = function(panel, ...)
+                if panel == gyroLightConePanel then return end
+                return click(panel, ...)
+            end
+        end
+    end
+end
+
+local function visibleLightConePreview(page)
+    if not page or not lightConePreviewPages[page] then return nil end
+    for panel in pairs(lightConePanels) do
+        local model = panel._lightcone_material_cmpt
+        if model and not model:Equals(nil) and model.isActiveAndEnabled
+            and not panel.is_force_hide and not panel._lightcone_need_to_hide then
+            return panel
+        end
+    end
+end
+
+local gyroRequestField
+local function hasGyroRequest()
+    if gyroRequestField == nil then
+        local ok, field = pcall(function()
+            local flags = CS.System.Enum.Parse(typeof(CS.System.Reflection.BindingFlags), "Instance, NonPublic")
+            return typeof(CS.RPG.Client.GyroManager):GetField("_RefCount", flags)
+        end)
+        gyroRequestField = ok and field or false
+    end
+    if not gyroRequestField then return false end
+    local ok, count = pcall(function()
+        local value = gyroRequestField:GetValue(CS.RPG.Client.GyroManager.Instance)
+        if type(value) == "number" then return value end
+        return value and tonumber(value:ToString())
+    end)
+    return ok and count ~= nil and count > 0
+end
+
 local state = rawget(_G, "__HSR_UI_PLAYTOOLS_V1")
 if not state then
     state = {}
@@ -46,6 +155,14 @@ end
 if state.altToggleMode == nil then
     state.altToggleMode=UE.PlayerPrefs.GetInt("HSRPlayTools.AltToggle",1)==1
 end
+local gyroPreference = "HSRPlayTools.GyroSimulation"
+if state.gyroSimulation == nil then
+    state.gyroSimulation = UE.PlayerPrefs.GetInt(gyroPreference, 1) == 1
+end
+local permissionPreference = "HSRPlayTools.PermissionManagement"
+if state.permissionManagement == nil then
+    state.permissionManagement = UE.PlayerPrefs.GetInt(permissionPreference, 1) == 1
+end
 if __HSRMouseCapture then __HSRMouseCapture(state.altToggleMode and -2 or -3) end
 if not state.sensitivity then
     state.sensitivity = math.max(0.25, math.min(5, UE.PlayerPrefs.GetFloat("HSRPlayTools.Sensitivity", 3)))
@@ -55,6 +172,24 @@ if not state.wheelSensitivity then
 end
 if __HSRSensitivity then __HSRSensitivity(state.sensitivity, state.wheelSensitivity) end
 if __HSRMouseDimensions then __HSRMouseDimensions(UE.Screen.width, UE.Screen.height) end
+local function playUISound(buttonType)
+    pcall(function()
+        local audio = CS.RPG.Client.GlobalVars.s_AudioManager
+        local kind = CS.RPG.Client.UIButtonSoundType[buttonType or "CommonClick"]
+        local event = audio:GetUIButtonSoundEventByType(kind)
+        if event and event ~= "" then audio:PostEvent(event) end
+    end)
+end
+
+local function syncWindowFocus()
+    local application = CS.RPG.Client.RPGApplication.Instance
+    if not application then return end
+
+    -- Under PlayCover, Unity can report focus while the macOS window is inactive.
+    local focused = __HSRWindowFocused() == 1
+    if application.IsFocus ~= focused then application:OnApplicationFocus(focused) end
+end
+
 -- Observe Unity's existing output without changing its logger or filter.
 state.consoleLines = state.consoleLines or {}
 if not state.consoleCallback then
@@ -74,7 +209,7 @@ local function updateAvatarScrolls(page)
         if go then state.avatarScrollRects=go:GetComponentsInChildren(typeof(UE.UI.ScrollRect),false) end
     end
 end
-local function transition(object,visible,finished)
+local function transition(object,visible,finished,fadeOut)
     if not object or object:Equals(nil) then return end
     local group=object:GetComponent(typeof(UE.CanvasGroup))
     if not group then
@@ -84,13 +219,19 @@ local function transition(object,visible,finished)
     group.interactable=visible
     group.blocksRaycasts=visible
     local wasActive=object.activeSelf
-    if visible then object:SetActive(true) end
     local transform=object.transform
-    local scale=wasActive and transform.localScale.x or 0.97
-    if not visible and wasActive then group.alpha=1 end
+    local collapsedScale=fadeOut and 0.94 or 0.97
+    local scale=wasActive and transform.localScale.x or collapsedScale
+    if visible then
+        transform.localScale=UE.Vector3(scale,scale,1)
+        object:SetActive(true)
+    elseif wasActive and not fadeOut then
+        group.alpha=1
+    end
     state.uiTransitions=state.uiTransitions or {}
     state.uiTransitions[object]={group=group,transform=transform,from=group.alpha,to=visible and 1 or 0,
-        scale=scale,started=UE.Time.unscaledTime,finished=finished}
+        scale=scale,collapsedScale=collapsedScale,fadeOut=fadeOut,duration=fadeOut and 0.16 or 0.1,
+        started=UE.Time.unscaledTime,finished=finished}
 end
 local function canvasCamera(object)
     local canvas=object:GetComponentInParent(typeof(UE.Canvas))
@@ -123,15 +264,15 @@ local function updateTransitions()
         if object:Equals(nil) or animation.group:Equals(nil) then
             state.uiTransitions[object]=nil
         else
-            local t=math.max(0,math.min(1,(now-animation.started)/0.1))
+            local t=math.max(0,math.min(1,(now-animation.started)/animation.duration))
             local eased=t*t*(3-2*t)
-            local targetScale=animation.to==1 and 1 or 0.97
+            local targetScale=animation.to==1 and 1 or animation.collapsedScale
             local scale=animation.scale+(targetScale-animation.scale)*eased
             animation.transform.localScale=UE.Vector3(scale,scale,1)
             -- Keep the closing surface opaque so overlapping slider graphics
             -- cannot linger through independently blended transparent layers.
-            if animation.to==1 then
-                animation.group.alpha=animation.from+(1-animation.from)*eased
+            if animation.to==1 or animation.fadeOut then
+                animation.group.alpha=animation.from+(animation.to-animation.from)*eased
             end
             if t>=1 then
                 if animation.to==0 then
@@ -150,11 +291,169 @@ local function updateTransitions()
     if not next(state.uiTransitions) then state.uiTransitions=nil end
     if completed then for _,finished in ipairs(completed) do finished() end end
 end
+local function rect(name, owner, x, y, w, h)
+    local go = UE.GameObject(name, typeof(UE.RectTransform))
+    go.transform:SetParent(owner, false)
+    local r = go:GetComponent(typeof(UE.RectTransform))
+    r.anchorMin = UE.Vector2(0.5, 0.5)
+    r.anchorMax = UE.Vector2(0.5, 0.5)
+    r.sizeDelta = UE.Vector2(w, h)
+    r.anchoredPosition = UE.Vector2(x, y)
+    return go
+end
+
+local function createOverlay(name, sortingOrder)
+    local root = UE.GameObject(name, typeof(UE.RectTransform))
+    local canvas = root:AddComponent(typeof(UE.Canvas))
+    canvas.renderMode = UE.RenderMode.ScreenSpaceOverlay
+    canvas.sortingOrder = sortingOrder
+    local scaler = root:AddComponent(typeof(UE.UI.CanvasScaler))
+    scaler.uiScaleMode = UE.UI.CanvasScaler.ScaleMode.ScaleWithScreenSize
+    scaler.referenceResolution = UE.Vector2(1920, 1080)
+    root:AddComponent(typeof(UE.UI.GraphicRaycaster))
+    return root
+end
+
+local function panelFont()
+    local font = state.panelFont
+    if font and not font:Equals(nil) then return font end
+    font = nil
+    local texts = UE.Resources.FindObjectsOfTypeAll(typeof(UE.UI.Text))
+    for i = 0, texts.Length - 1 do
+        if texts[i].font then
+            font = font or texts[i].font
+            if string.find(texts[i].text or "", "[\228-\233]") then
+                font = texts[i].font
+                break
+            end
+        end
+    end
+    state.panelFont = font or UE.Resources.GetBuiltinResource(typeof(UE.Font), "Arial.ttf")
+    return state.panelFont
+end
+
+local gyroPromptName = "HSRPlayToolsGyroPrompt"
+local gyroPromptSeconds = 5
+
+local function destroyGyroPrompt(prompt)
+    if not prompt then return end
+    if state.uiTransitions then state.uiTransitions[prompt.card] = nil end
+    if not prompt.root:Equals(nil) then
+        prompt.root:SetActive(false)
+        UE.Object.Destroy(prompt.root)
+    end
+end
+
+local function hideGyroPrompt(immediate)
+    local prompt = state.gyroPrompt
+    if not prompt and not immediate then return end
+    state.gyroPrompt = nil
+    destroyGyroPrompt(state.closingGyroPrompt)
+    state.closingGyroPrompt = nil
+    if not prompt then return end
+    if immediate or prompt.card:Equals(nil) then
+        destroyGyroPrompt(prompt)
+        return
+    end
+    state.closingGyroPrompt = prompt
+    transition(prompt.card, false, function()
+        destroyGyroPrompt(prompt)
+        state.closingGyroPrompt = nil
+    end, true)
+end
+
+local function updateGyroPrompt(source, decision)
+    local prompt = state.gyroPrompt
+    if source and prompt and source == prompt.source and not prompt.root:Equals(nil) then
+        local remaining = math.ceil(prompt.deadline - UE.Time.unscaledTime)
+        if remaining <= 0 then
+            hideGyroPrompt()
+        elseif remaining ~= prompt.remaining then
+            prompt.remaining = remaining
+            prompt.allowLabel.text = "允许（" .. remaining .. "）"
+        end
+        return
+    end
+    hideGyroPrompt()
+    if not source or decision ~= 0 then return end
+
+    local root = createOverlay(gyroPromptName, 32690)
+    local card = rect("GyroPermission", root.transform, -24, 24, 376, 168)
+    prompt = {root = root, card = card, source = source,
+        deadline = UE.Time.unscaledTime + gyroPromptSeconds, remaining = gyroPromptSeconds}
+    state.gyroPrompt = prompt
+    card:SetActive(false)
+    card.transform.anchorMin = UE.Vector2(1, 0)
+    card.transform.anchorMax = UE.Vector2(1, 0)
+    card.transform.pivot = UE.Vector2(1, 0)
+    card.transform.anchoredPosition = UE.Vector2(-24, 24)
+    card:AddComponent(typeof(UE.UI.Image)).color = UE.Color(0.9, 0.9, 0.9, 1)
+    local shadow = card:AddComponent(typeof(UE.UI.Shadow))
+    shadow.effectColor = UE.Color(0, 0, 0, 0.3)
+    shadow.effectDistance = UE.Vector2(4, -4)
+
+    local font = panelFont()
+    local function text(owner, name, value, x, y, width, height, size, alignment)
+        local label = rect(name, owner, x, y, width, height):AddComponent(typeof(UE.UI.Text))
+        label.font, label.fontSize, label.text = font, size, value
+        label.alignment = alignment
+        label.color = UE.Color(0.19, 0.19, 0.19, 1)
+        label.raycastTarget = false
+        return label
+    end
+    text(card.transform, "Title", "权限申请", 0, 54, 336, 28, 22, UE.TextAnchor.MiddleLeft)
+    local message = text(card.transform, "Message", source .. " 想要使用陀螺仪，是否允许？",
+        0, 7, 336, 60, 17, UE.TextAnchor.MiddleLeft)
+    message.resizeTextForBestFit = true
+    message.resizeTextMinSize, message.resizeTextMaxSize = 12, 17
+
+    local function choice(name, x, allow)
+        local item = rect(name, card.transform, x, -47, 104, 36)
+        local image = item:AddComponent(typeof(UE.UI.Image))
+        image.color = UE.Color(1, 1, 1, 1)
+        local button = item:AddComponent(typeof(UE.UI.Button))
+        button.targetGraphic = image
+        local label = text(item.transform, "Label", name, 0, 0, 104, 36, 17, UE.TextAnchor.MiddleCenter)
+        button.onClick:AddListener(function()
+            if state.gyroPrompt ~= prompt then return end
+            if allow then playUISound() else playUISound("CommonCancel") end
+            if not allow then __HSRGyroDecision(source, -1) end
+            hideGyroPrompt()
+        end)
+        return label
+    end
+    choice("禁止", 0, false)
+    prompt.allowLabel = choice("允许（" .. prompt.remaining .. "）", 116, true)
+    transition(card, true, nil, true)
+    __HSRGyroDecision(source, 1)
+end
+
+local function updateGyroEffect(page, lightCone)
+    local source, known = gyroRequestSource(page)
+    local enabled = known == true
+    local promptSource, decision
+    if source and not enabled and (lightCone or hasGyroRequest()) then
+        if state.permissionManagement then
+            decision = __HSRGyroDecision(source)
+            enabled = decision ~= -1
+            if enabled then promptSource = source end
+        else
+            enabled = true
+        end
+    end
+    __HSRGyroPointer(enabled and 1 or 0)
+    updateGyroPrompt(promptSource, decision)
+    return enabled
+end
+
 -- One owner and one cleanup path for the menu entry and independent overlay.
 local function disposeSettings()
     if state.settingsLeave then pcall(state.settingsLeave) end
     if __HSRMouseCapture then __HSRMouseCapture(-15) end
-    state.uiTransitions=nil
+    if state.uiTransitions and state.settingsPanels then
+        for _,object in ipairs(state.settingsPanels) do state.uiTransitions[object]=nil end
+    end
+    state.settingsPanels=nil
     state.consoleRefresh=nil
     state.altModeTap=nil
     state.altModeTapTarget=nil
@@ -184,7 +483,8 @@ if not state.settingsUIInitialized then
     local objects=UE.Resources.FindObjectsOfTypeAll(typeof(UE.GameObject))
     for i=0,objects.Length-1 do
         local object=objects[i]
-        if (object.name=="HSRPlayToolsSettings" or object.name=="HSRPlayToolsMenuEntry")
+        if (object.name=="HSRPlayToolsSettings" or object.name=="HSRPlayToolsMenuEntry"
+            or object.name==gyroPromptName)
             and object.scene:IsValid() and object.scene.isLoaded then
             object:SetActive(false)
             UE.Object.Destroy(object)
@@ -210,37 +510,8 @@ local function updateSettings()
     -- Independent overlay does not require a game-owned canvas.
     local created
     local success, failure = pcall(function()
-        local function rect(name, owner, x, y, w, h)
-            local go = UE.GameObject(name, typeof(UE.RectTransform))
-            go.transform:SetParent(owner, false)
-            local r = go:GetComponent(typeof(UE.RectTransform))
-            r.anchorMin = UE.Vector2(0.5, 0.5)
-            r.anchorMax = UE.Vector2(0.5, 0.5)
-            r.sizeDelta = UE.Vector2(w, h)
-            r.anchoredPosition = UE.Vector2(x, y)
-            return go
-        end
-        created = UE.GameObject("HSRPlayToolsSettings", typeof(UE.RectTransform))
-        local overlay = created:AddComponent(typeof(UE.Canvas))
-        overlay.renderMode = UE.RenderMode.ScreenSpaceOverlay
-        overlay.sortingOrder = 32700
-        local scaler = created:AddComponent(typeof(UE.UI.CanvasScaler))
-        scaler.uiScaleMode = UE.UI.CanvasScaler.ScaleMode.ScaleWithScreenSize
-        scaler.referenceResolution = UE.Vector2(1920, 1080)
-        created:AddComponent(typeof(UE.UI.GraphicRaycaster))
-        local font
-        local texts = UE.Resources.FindObjectsOfTypeAll(typeof(UE.UI.Text))
-        -- Prefer a live game font already used for Chinese labels.
-        for i = 0, texts.Length - 1 do
-            if texts[i].font then
-                font = font or texts[i].font
-                if string.find(texts[i].text or "", "[\228-\233]") then
-                    font = texts[i].font
-                    break
-                end
-            end
-        end
-        if not font then font = UE.Resources.GetBuiltinResource(typeof(UE.Font), "Arial.ttf") end
+        created = createOverlay("HSRPlayToolsSettings", 32700)
+        local font = panelFont()
         local function label(go, text)
             local child = rect("Label", go.transform, 0, 0, 420, 44)
             local t = child:AddComponent(typeof(UE.UI.Text))
@@ -250,7 +521,7 @@ local function updateSettings()
             t.raycastTarget = false
             return t
         end
-        local function button(owner, name, x, y, action)
+        local function button(owner, name, x, y, action, sound)
             local go = rect(name, owner, x, y, 440, 50)
             local image = go:AddComponent(typeof(UE.UI.Image))
             image.color = UE.Color(1, 1, 1, 1)
@@ -267,11 +538,14 @@ local function updateSettings()
             colors.colorMultiplier, colors.fadeDuration = 1, 0.1
             b.colors = colors
             local t = label(go, name)
-            b.onClick:AddListener(action)
+            b.onClick:AddListener(function()
+                if sound ~= false then playUISound(sound) end
+                action()
+            end)
             return t
         end
         local function closeButton(owner,x,y,action)
-            local text=button(owner,"×",x,y,action)
+            local text=button(owner,"×",x,y,action,"CommonCancel")
             text.transform.parent:GetComponent(typeof(UE.RectTransform)).sizeDelta=UE.Vector2(44,44)
             text.rectTransform.sizeDelta=UE.Vector2(44,44)
             text.fontSize=30
@@ -303,7 +577,15 @@ local function updateSettings()
             control.maxValue = math.floor((maximum-minimum)/step+0.5)
             control.wholeNumbers = true
             control.value = math.floor((value-minimum)/step+0.5)
-            control.onValueChanged:AddListener(function(v) changed(minimum+v*step) end)
+            local lastSound = -math.huge
+            control.onValueChanged:AddListener(function(v)
+                local now = UE.Time.unscaledTime
+                if now - lastSound >= 0.08 then
+                    playUISound("SlideClick")
+                    lastSound = now
+                end
+                changed(minimum+v*step)
+            end)
             return text
         end
         local function panelShadow(object)
@@ -320,13 +602,15 @@ local function updateSettings()
         panel:AddComponent(typeof(UE.UI.Image)).color = UE.Color(0.82, 0.82, 0.82, 1)
         panelShadow(panel)
         label(rect("Title", panel.transform, 0, 350, 440, 50), "HSR PlayTools 设置")
-        local scale, sensitivity, wheelSensitivity, altMode
+        local scale, sensitivity, wheelSensitivity, altMode, gyroMode, permissionMode
         local function refresh()
             wheelSensitivity.text = "滚轮灵敏度：" .. string.format("%.1f×", state.wheelSensitivity)
             sensitivity.text = "鼠标灵敏度：" .. string.format("%.2f×", state.sensitivity)
             scale.text = "界面缩放：" .. tostring(math.floor(state.target * 100 + 0.5)) .. "%"
             state.altToggleMode=__HSRMouseCapture(-12)==1
             altMode.text = "Alt 释放模式：" .. (state.altToggleMode and "按下切换" or "按住释放")
+            gyroMode.text = "陀螺仪模拟：" .. (state.gyroSimulation and "开启" or "关闭")
+            permissionMode.text = "权限管理：" .. (state.permissionManagement and "开启" or "关闭")
         end
         wheelSensitivity = slider(panel.transform, "WheelSensitivity", 230, 0.5, 10, 0.5, state.wheelSensitivity, function(value)
             state.wheelSensitivity = value
@@ -352,16 +636,35 @@ local function updateSettings()
             local now=UE.Time.unscaledTime
             if release==lastAltRelease and now-lastAltTime<0.15 then return end
             lastAltRelease,lastAltTime=release,now
+            playUISound()
             local toggle=__HSRMouseCapture(-12)~=1
             __HSRMouseCapture(toggle and -2 or -3)
             refresh()
             UE.PlayerPrefs.SetInt("HSRPlayTools.AltToggle",state.altToggleMode and 1 or 0)
             UE.PlayerPrefs.Save()
         end
-        altMode = button(panel.transform,"AltReleaseMode",0,-100,toggleAltMode)
+        local firstOptionY, optionSpacing = -100, 70
+        altMode = button(panel.transform,"AltReleaseMode",0,firstOptionY,toggleAltMode,false)
         state.altModeTapTarget=altMode.transform.parent:GetComponent(typeof(UE.RectTransform))
         state.altModeTapAction=toggleAltMode
         state.altPressSeen,state.altReleaseSeen=__HSRMouseCapture(-13)
+        gyroMode = button(panel.transform, "GyroSimulation", 0, firstOptionY - optionSpacing, function()
+            state.gyroSimulation = not state.gyroSimulation
+            if not state.gyroSimulation then
+                __HSRGyroPointer(0)
+                hideGyroPrompt()
+            end
+            UE.PlayerPrefs.SetInt(gyroPreference, state.gyroSimulation and 1 or 0)
+            UE.PlayerPrefs.Save()
+            refresh()
+        end)
+        permissionMode = button(panel.transform, "PermissionManagement", 0, firstOptionY - 2 * optionSpacing, function()
+            state.permissionManagement = not state.permissionManagement
+            if not state.permissionManagement then hideGyroPrompt(true) end
+            UE.PlayerPrefs.SetInt(permissionPreference, state.permissionManagement and 1 or 0)
+            UE.PlayerPrefs.Save()
+            refresh()
+        end)
         local console = rect("UnityConsole", created.transform, 0, 0, 1500, 850)
         console:AddComponent(typeof(UE.UI.Image)).color = UE.Color(0.9, 0.9, 0.9, 1)
         panelShadow(console)
@@ -417,7 +720,7 @@ local function updateSettings()
             console.transform:SetAsLastSibling()
             switchPanel(panel,console)
         end
-        button(panel.transform, "打开 Unity 控制台", 0, -170, showConsole)
+        button(panel.transform, "打开 Unity 控制台", 0, firstOptionY - 3 * optionSpacing, showConsole)
         closeButton(console.transform,700,380, function()
             switchPanel(console,panel)
         end)
@@ -430,7 +733,7 @@ local function updateSettings()
         closeButton(panel.transform,290,350,function()
             if state.settingsLeave then state.settingsLeave() end
         end)
-        local version=label(rect("Version",panel.transform,210,-350,180,32),__HSRVersion() .. "@Rd")
+        local version=label(rect("Version",panel.transform,210,-360,180,32),__HSRVersion() .. "@Rd")
         version.rectTransform.sizeDelta=UE.Vector2(180,32)
         version.alignment=UE.TextAnchor.MiddleRight
         version.fontSize=16
@@ -520,12 +823,15 @@ local function updateSettings()
         blocker:AddComponent(typeof(UE.UI.Image)).color = UE.Color(0,0,0,0)
         blocker.transform:SetAsFirstSibling()
         local function leave()
+            if not state.playtoolsPageOpen then return end
             transition(panel,false)
             transition(console,false)
             transition(blocker,false,function() __HSRMouseCapture(-15) end)
             state.playtoolsPageOpen = false
         end
         local function openPlayTools()
+            if state.playtoolsPageOpen then return end
+            playUISound()
             __HSRMouseCapture(-14)
             refresh()
             transition(blocker,true)
@@ -535,7 +841,8 @@ local function updateSettings()
         end
         nativeButton.onClick:AddListener(openPlayTools)
         state.settingsOpen = openPlayTools
-        for _,object in ipairs({panel,console,blocker}) do
+        state.settingsPanels={panel,console,blocker}
+        for _,object in ipairs(state.settingsPanels) do
             local group=object:AddComponent(typeof(UE.CanvasGroup))
             group.alpha=0
             group.interactable=false
@@ -599,7 +906,9 @@ if okFind and scalers then
             local canvas = scaler:GetComponent(typeof(UE.Canvas))
             -- Exclude world-space labels and nested canvas scalers.
             if not canvas or not canvas.isRootCanvas or canvas.renderMode == UE.RenderMode.WorldSpace then return end
-            if scaler.gameObject.name == "HSRPlayToolsSettings" then return end
+            -- Plugin overlays keep the same layout whether created before or after this pass.
+            local name = scaler.gameObject.name
+            if name == "HSRPlayToolsSettings" or name == gyroPromptName then return end
             local id = scaler:GetInstanceID()
             local mode
             if scaler.uiScaleMode == UE.UI.CanvasScaler.ScaleMode.ConstantPixelSize then mode = 0
@@ -627,8 +936,14 @@ applyUIScale()
 -- Use the native cursor controller for Alt/UI state; macOS capture supplies
 -- relative movement where iOS Cursor.lockState is ineffective.
 if type(rawget(_G,"__HSRNativeInputFrame"))~="function" then
+    pcall(observeActivityPage)
+    pcall(observeLightConePreviews)
     rawset(_G, "__HSRNativeInputFrame", function()
-        if not __HSRMouseCapture then return end
+        if not __HSRMouseCapture then
+            gyroLightConePanel = nil
+            return
+        end
+        pcall(syncWindowFocus)
         local ok = pcall(function()
             local alt = __HSRMouseCapture(-1) == 1
             local tabWheel = UE.Input.GetKey(UE.KeyCode.Tab)
@@ -660,6 +975,7 @@ if type(rawget(_G,"__HSRNativeInputFrame"))~="function" then
                     end
                 end)
                 disposeSettings()
+                hideGyroPrompt(true)
                 state.cursorEvent=nil
                 state.cursorHits=nil
                 state.pointerHoverMethod=nil
@@ -689,12 +1005,28 @@ if type(rawget(_G,"__HSRNativeInputFrame"))~="function" then
             end
             if page then state.runtimeLoginPage=loginPage end
             if not ui or not cursor or not current or not module then
+                gyroLightConePanel = nil
+                updateGyroEffect(nil)
+                updateTransitions()
                 __HSRMouseCapture(0)
                 __HSRMouseCapture(-8)
                 return
             end
+            local gyroEligible = state.gyroSimulation and page and page~="" and not loginPage and not explorationPages[page]
+                and not module.IsShowSDKUI and not state.playtoolsPageOpen
+            local gyroPage = gyroEligible and page or nil
+            local lightConePreview = visibleLightConePreview(gyroPage)
+            gyroLightConePanel = updateGyroEffect(gyroPage, lightConePreview) and lightConePreview or nil
+            if gyroLightConePanel then
+                pcall(function()
+                    -- The stock gyro callback takes the horizontal tilt in card coordinates.
+                    local gravity = CS.RPG.Client.GyroManager.Instance.Gravity
+                    gyroLightConePanel:set_lightcone_rot(-gravity.x)
+                end)
+            end
             if __HSRMouseDimensions then __HSRMouseDimensions(UE.Screen.width,UE.Screen.height) end
             if __HSRMouseCapture(-16)==1 and state.playtoolsPageOpen and state.settingsLeave then
+                playUISound("CommonCancel")
                 state.settingsLeave()
             end
             updateTransitions()
@@ -1034,6 +1366,9 @@ if type(rawget(_G,"__HSRNativeInputFrame"))~="function" then
             end)
         end)
         if not ok then
+            gyroLightConePanel = nil
+            __HSRGyroPointer(0)
+            pcall(hideGyroPrompt,true)
             __HSRMouseCapture(0)
             __HSRMouseCapture(-8)
         end
